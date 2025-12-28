@@ -1,4 +1,4 @@
-name: Build LiBwrt OpenWrt (Cached & Release)
+name: Build LiBwrt OpenWrt
 
 on:
   workflow_dispatch:
@@ -9,16 +9,15 @@ on:
         default: 'false'
 
 permissions:
-  contents: write  # 必须添加此权限才能发布 Release
+  contents: write
 
 env:
   REPO_URL: https://github.com/LiBwrt-op/openwrt-6.x.git
   REPO_BRANCH: main-nss
   TZ: Asia/Shanghai
-  # 新增变量控制
-  CACHE_TOOLCHAIN: true     # 是否开启工具链缓存
-  FIRMWARE_RELEASE: true    # 是否发布 Release
-  FIRMWARE_TAG: LiBwrt-OpenWrt # Release 的 Tag 前缀
+  CACHE_TOOLCHAIN: true
+  FIRMWARE_RELEASE: true
+  FIRMWARE_TAG: LiBwrt-OpenWrt
 
 jobs:
   build:
@@ -35,42 +34,24 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 安装编译依赖 (保留原工作流的依赖设置)
         sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
         sudo -E apt -yqq install dos2unix libfuse-dev
         sudo -E apt -yqq autoremove --purge
         sudo -E apt -yqq autoclean
         sudo -E apt -yqq clean
         sudo -E systemctl daemon-reload
-        
-        # 设置时区
         sudo timedatectl set-timezone "$TZ"
-        echo "Disk space after cleanup:"
-        df -h
 
     - name: Clone Source Code & Extract Info
       run: |
-        # 克隆源码
         git clone --depth 1 --single-branch -b $REPO_BRANCH $REPO_URL libwrt
         echo "FILE_PATH=$PWD/libwrt" >> $GITHUB_ENV
         
-        # 进入目录提取信息 (参考第二个工作流)
+        # 提取源码的 Git 提交信息（此时还没有manifest，只能从git提取）
         cd libwrt
-        
-        # 1. 提取基础版本信息
-        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
-        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
-        
-        # 2. 提取内核版本 (尝试在 include/kernel* 中查找)
-        # 注意：不同源码路径可能不同，这里做一个模糊匹配尝试
-        VERSION_KERNEL=$(grep -oP 'LINUX_KERNEL_HASH-\K[0-9]+\.[0-9]+\.[0-9]+' include/kernel* | head -n 1)
-        [ -z "$VERSION_KERNEL" ] && VERSION_KERNEL="Unknown"
-        echo "VERSION_KERNEL=$VERSION_KERNEL" >> $GITHUB_ENV
-        
-        # 3. 提取最近更新日志
+        # 提取最近更新日志
         if git log --since="$(date -d 'yesterday 00:00' '+%Y-%m-%dT%H:%M:%S')" --until="$(date -d 'today 00:00' '+%Y-%m-%dT%H:%M:%S')" --pretty=format:"%h %s" --no-merges -- . ':(exclude)scripts/feeds' | grep -q .; then
           VERSION_LOG=$(git log --since="$(date -d 'yesterday 00:00' '+%Y-%m-%dT%H:%M:%S')" --until="$(date -d 'today 00:00' '+%Y-%m-%dT%H:%M:%S')" --pretty=format:"%h %s" --no-merges -- . ':(exclude)scripts/feeds')
-          # 处理换行符以便写入 ENV
           VERSION_LOG="${VERSION_LOG//'%'/'%25'}"
           VERSION_LOG="${VERSION_LOG//$'\n'/'%0A'}"
           VERSION_LOG="${VERSION_LOG//$'\r'/'%0D'}"
@@ -88,7 +69,6 @@ jobs:
     - name: Load Configuration & Generate Vars
       working-directory: ${{ env.FILE_PATH }}
       run: |
-        # 处理配置文件
         if [ -e $GITHUB_WORKSPACE/.config ]; then
           echo "Found custom .config, using it..."
           cp $GITHUB_WORKSPACE/.config ./.config
@@ -97,20 +77,16 @@ jobs:
           make defconfig
         fi
         
-        # 生成编译目标的变量 (用于缓存 Key)
         DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
         echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
-        
-        echo "Target: $DEVICE_TARGET | Subtarget: $DEVICE_SUBTARGET"
 
     - name: Cache Toolchain
       if: env.CACHE_TOOLCHAIN == 'true'
       uses: HiGarfield/cachewrtbuild@main
       with:
         ccache: false
-        # 混合 Key：源码分支 + 目标平台 + 子平台
         mixkey: ${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
         prefix: ${{ env.FILE_PATH }}
 
@@ -118,7 +94,6 @@ jobs:
       working-directory: ${{ env.FILE_PATH }}
       run: |
         make download -j8
-        # 检查下载完整性
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
 
@@ -129,12 +104,10 @@ jobs:
         echo "Starting build..."
         make -j$(nproc) || make -j1 V=s
         echo "status=success" >> $GITHUB_OUTPUT
-        
-        # 生成时间变量用于文件名
         echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
         echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
 
-    - name: Organize Files
+    - name: Organize Files & Parse Manifest
       id: organize
       if: steps.compile.outputs.status == 'success' && !cancelled()
       run: |
@@ -142,10 +115,35 @@ jobs:
         cd ${{ env.FILE_PATH }}/bin/targets/*/*
         rm -rf packages
         
-        # 为了方便 Release，我们可以把 config 也放进去
+        # 复制配置文件到固件目录
         cp ${{ env.FILE_PATH }}/.config ./build.config
         
-        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        # --- 解析 Manifest 文件 (新增功能) ---
+        # 查找 manifest 文件 (兼容不同后缀)
+        manifest_file=$(find . -maxdepth 1 -type f \( -name "*.manifest" -o -name "*.manifest.txt" \) | head -n 1)
+        
+        if [ -f "$manifest_file" ]; then
+          echo "Found manifest file: $manifest_file"
+          # 提取 Kernel 版本
+          kernel_ver=$(grep -m 1 "^kernel - " "$manifest_file" | awk -F ' - ' '{print $2}')
+          echo "KERNEL_VER=$kernel_ver" >> $GITHUB_ENV
+          
+          # 提取 LuCI 版本
+          luci_ver=$(grep -m 1 "^luci - " "$manifest_file" | awk -F ' - ' '{print $2}')
+          echo "LUCI_VER=$luci_ver" >> $GITHUB_ENV
+          
+          # 提取 Base Files 版本
+          base_ver=$(grep -m 1 "^base-files - " "$manifest_file" | awk -F ' - ' '{print $2}')
+          echo "BASE_VER=$base_ver" >> $GITHUB_ENV
+        else
+          echo "Manifest file not found!"
+          echo "KERNEL_VER=Unknown" >> $GITHUB_ENV
+          echo "LUCI_VER=Unknown" >> $GITHUB_ENV
+        fi
+        # ------------------------------------
+        
+        # 设定关键变量：FIRMWARE_PATH (修复之前变量名不匹配导致上传根目录的问题)
+        echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
         echo "status=success" >> $GITHUB_OUTPUT
 
     - name: Upload Firmware Directory (Artifact)
@@ -153,7 +151,7 @@ jobs:
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
         name: OpenWrt_firmware_${{ env.DEVICE_TARGET }}_${{ env.FILE_DATE }}
-        path: ${{ env.FIRMWARE }}
+        path: ${{ env.FIRMWARE_PATH }}
 
     - name: Upload Firmware To Release
       if: steps.organize.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true' && !cancelled()
@@ -163,8 +161,8 @@ jobs:
         allowUpdates: true
         tag: ${{ env.FIRMWARE_TAG }}
         token: ${{ secrets.GITHUB_TOKEN }}
+        # 使用正确的路径变量
         artifacts: ${{ env.FIRMWARE_PATH }}/*
-        # 使用之前提取的变量构建 Release Body
         body: |
           **This is OpenWrt Firmware for ${{ env.DEVICE_TARGET }} / ${{ env.DEVICE_SUBTARGET }}**
           
@@ -174,12 +172,12 @@ jobs:
           - ⚽ 固件源码: ${{ env.REPO_URL }}
           - 💝 源码分支: ${{ env.REPO_BRANCH }}
           - 🌐 默认地址: 192.168.1.1 (默认配置下)
-          - 🔑 默认密码: 无 (默认配置下)
+          - 🔑 默认密码: password (默认配置下)
           
-          ### 🧊 版本详情
-          - 固件内核版本：${{ env.VERSION_KERNEL }}
-          - 最后一次源码更新：
-          ${{ env.VERSION_INFO }}
+          ### 🧊 版本详情 (From Manifest)
+          - **Kernel**: ${{ env.KERNEL_VER }}
+          - **LuCI**: ${{ env.LUCI_VER }}
+          - **Base**: ${{ env.BASE_VER }}
           
-          ### 📝 更新日志 (最近24小时)
+          ### 🔄 源码更新日志 (最近24小时)
           ${{ env.VERSION_LOG }}
