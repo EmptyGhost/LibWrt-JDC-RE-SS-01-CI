@@ -1,4 +1,4 @@
-name: Build LiBwrt OpenWrt
+name: Build LiBwrt OpenWrt (Cached & Release)
 
 on:
   workflow_dispatch:
@@ -8,15 +8,21 @@ on:
         required: false
         default: 'false'
 
+permissions:
+  contents: write  # 必须添加此权限才能发布 Release
+
 env:
   REPO_URL: https://github.com/LiBwrt-op/openwrt-6.x.git
-  REPO_BRANCH: main-nss  # 根据你的步骤5，分支似乎是 main-nss，如果克隆默认分支出错，请检查此处
+  REPO_BRANCH: main-nss
   TZ: Asia/Shanghai
+  # 新增变量控制
+  CACHE_TOOLCHAIN: true     # 是否开启工具链缓存
+  FIRMWARE_RELEASE: true    # 是否发布 Release
+  FIRMWARE_TAG: LiBwrt-OpenWrt # Release 的 Tag 前缀
 
 jobs:
   build:
     runs-on: ubuntu-24.04
-
 
     steps:
     - name: Free disk space
@@ -29,11 +35,9 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        
-        # 安装编译依赖 (根据你提供的信息)
+        # 安装编译依赖 (保留原工作流的依赖设置)
         sudo bash -c 'bash <(curl -sL https://build-scripts.immortalwrt.org/init_build_environment.sh)'
-        sudo -E apt -yqq install dos2unix
-        sudo -E apt -yqq install libfuse-dev
+        sudo -E apt -yqq install dos2unix libfuse-dev
         sudo -E apt -yqq autoremove --purge
         sudo -E apt -yqq autoclean
         sudo -E apt -yqq clean
@@ -44,26 +48,47 @@ jobs:
         echo "Disk space after cleanup:"
         df -h
 
-    - name: Clone Source Code
+    - name: Clone Source Code & Extract Info
       run: |
-        # 对应步骤3: 克隆源码
-        # 注意：这里根据步骤5的信息推测分支可能为 main-nss，如果只是默认分支去掉 -b 参数即可
-        # git clone --depth 1 --single-branch $REPO_URL libwrt
+        # 克隆源码
         git clone --depth 1 --single-branch -b $REPO_BRANCH $REPO_URL libwrt
         echo "FILE_PATH=$PWD/libwrt" >> $GITHUB_ENV
+        
+        # 进入目录提取信息 (参考第二个工作流)
+        cd libwrt
+        
+        # 1. 提取基础版本信息
+        VERSION_INFO=$(git show -s --date=short --format="作者: %an<br/>时间: %cd<br/>内容: %s<br/>hash: %H")
+        echo "VERSION_INFO=$VERSION_INFO" >> $GITHUB_ENV
+        
+        # 2. 提取内核版本 (尝试在 include/kernel* 中查找)
+        # 注意：不同源码路径可能不同，这里做一个模糊匹配尝试
+        VERSION_KERNEL=$(grep -oP 'LINUX_KERNEL_HASH-\K[0-9]+\.[0-9]+\.[0-9]+' include/kernel* | head -n 1)
+        [ -z "$VERSION_KERNEL" ] && VERSION_KERNEL="Unknown"
+        echo "VERSION_KERNEL=$VERSION_KERNEL" >> $GITHUB_ENV
+        
+        # 3. 提取最近更新日志
+        if git log --since="$(date -d 'yesterday 00:00' '+%Y-%m-%dT%H:%M:%S')" --until="$(date -d 'today 00:00' '+%Y-%m-%dT%H:%M:%S')" --pretty=format:"%h %s" --no-merges -- . ':(exclude)scripts/feeds' | grep -q .; then
+          VERSION_LOG=$(git log --since="$(date -d 'yesterday 00:00' '+%Y-%m-%dT%H:%M:%S')" --until="$(date -d 'today 00:00' '+%Y-%m-%dT%H:%M:%S')" --pretty=format:"%h %s" --no-merges -- . ':(exclude)scripts/feeds')
+          # 处理换行符以便写入 ENV
+          VERSION_LOG="${VERSION_LOG//'%'/'%25'}"
+          VERSION_LOG="${VERSION_LOG//$'\n'/'%0A'}"
+          VERSION_LOG="${VERSION_LOG//$'\r'/'%0D'}"
+          echo "VERSION_LOG=$VERSION_LOG" >> $GITHUB_ENV
+        else
+          echo "VERSION_LOG=暂无更新" >> $GITHUB_ENV
+        fi
 
     - name: Update & Install Feeds
       working-directory: ${{ env.FILE_PATH }}
       run: |
-        # 对应步骤3: 更新 feeds
         ./scripts/feeds update -a
         ./scripts/feeds install -a
 
-    - name: Load Configuration
+    - name: Load Configuration & Generate Vars
       working-directory: ${{ env.FILE_PATH }}
       run: |
         # 处理配置文件
-        # 如果你的仓库根目录下有 .config 文件，则使用它
         if [ -e $GITHUB_WORKSPACE/.config ]; then
           echo "Found custom .config, using it..."
           cp $GITHUB_WORKSPACE/.config ./.config
@@ -71,23 +96,43 @@ jobs:
           echo "No .config found, using default configuration (make defconfig)..."
           make defconfig
         fi
+        
+        # 生成编译目标的变量 (用于缓存 Key)
+        DEVICE_TARGET=$(cat .config | grep CONFIG_TARGET_BOARD | awk -F '"' '{print $2}')
+        echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
+        DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
+        echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+        
+        echo "Target: $DEVICE_TARGET | Subtarget: $DEVICE_SUBTARGET"
+
+    - name: Cache Toolchain
+      if: env.CACHE_TOOLCHAIN == 'true'
+      uses: HiGarfield/cachewrtbuild@main
+      with:
+        ccache: false
+        # 混合 Key：源码分支 + 目标平台 + 子平台
+        mixkey: ${{ env.REPO_BRANCH }}-${{ env.DEVICE_TARGET }}-${{ env.DEVICE_SUBTARGET }}
+        prefix: ${{ env.FILE_PATH }}
 
     - name: Download Libraries
       working-directory: ${{ env.FILE_PATH }}
       run: |
-        # 对应步骤4: 下载依赖库
         make download -j8
-        # 检查下载完整性 (find dl -size -1024c -exec ls -l {} \;)
+        # 检查下载完整性
+        find dl -size -1024c -exec ls -l {} \;
+        find dl -size -1024c -exec rm -f {} \;
 
     - name: Compile Firmware
       id: compile
       working-directory: ${{ env.FILE_PATH }}
       run: |
-        # 对应步骤4: 开始编译
         echo "Starting build..."
-        # 尝试多线程编译，如果失败则回退到单线程显示错误日志
         make -j$(nproc) || make -j1 V=s
-        echo "::set-output name=status::success"
+        echo "status=success" >> $GITHUB_OUTPUT
+        
+        # 生成时间变量用于文件名
+        echo "DATE=$(date +"%Y-%m-%d %H:%M:%S")" >> $GITHUB_ENV
+        echo "FILE_DATE=$(date +"%Y.%m.%d")" >> $GITHUB_ENV
 
     - name: Organize Files
       id: organize
@@ -96,12 +141,45 @@ jobs:
         # 整理输出文件
         cd ${{ env.FILE_PATH }}/bin/targets/*/*
         rm -rf packages
+        
+        # 为了方便 Release，我们可以把 config 也放进去
+        cp ${{ env.FILE_PATH }}/.config ./build.config
+        
         echo "FIRMWARE=$PWD" >> $GITHUB_ENV
-        echo "::set-output name=status::success"
+        echo "status=success" >> $GITHUB_OUTPUT
 
-    - name: Upload Firmware Directory
+    - name: Upload Firmware Directory (Artifact)
       uses: actions/upload-artifact@v4
       if: steps.organize.outputs.status == 'success' && !cancelled()
       with:
-        name: OpenWrt_firmware
+        name: OpenWrt_firmware_${{ env.DEVICE_TARGET }}_${{ env.FILE_DATE }}
         path: ${{ env.FIRMWARE }}
+
+    - name: Upload Firmware To Release
+      if: steps.organize.outputs.status == 'success' && env.FIRMWARE_RELEASE == 'true' && !cancelled()
+      uses: ncipollo/release-action@v1
+      with:
+        name: R${{ env.FILE_DATE }} ${{ env.FIRMWARE_TAG }}
+        allowUpdates: true
+        tag: ${{ env.FIRMWARE_TAG }}
+        token: ${{ secrets.GITHUB_TOKEN }}
+        artifacts: ${{ env.FIRMWARE_PATH }}/*
+        # 使用之前提取的变量构建 Release Body
+        body: |
+          **This is OpenWrt Firmware for ${{ env.DEVICE_TARGET }} / ${{ env.DEVICE_SUBTARGET }}**
+          
+          ### 📒 固件信息
+          - 编译时间: ${{ env.DATE }}
+          - 平台架构: ${{ env.DEVICE_TARGET }} - ${{ env.DEVICE_SUBTARGET }}
+          - ⚽ 固件源码: ${{ env.REPO_URL }}
+          - 💝 源码分支: ${{ env.REPO_BRANCH }}
+          - 🌐 默认地址: 192.168.1.1 (默认配置下)
+          - 🔑 默认密码: 无 (默认配置下)
+          
+          ### 🧊 版本详情
+          - 固件内核版本：${{ env.VERSION_KERNEL }}
+          - 最后一次源码更新：
+          ${{ env.VERSION_INFO }}
+          
+          ### 📝 更新日志 (最近24小时)
+          ${{ env.VERSION_LOG }}
