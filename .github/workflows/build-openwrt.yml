@@ -1,0 +1,110 @@
+name: Build LiBwrt OpenWrt
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions (true/false)'
+        required: false
+        default: 'false'
+
+env:
+  REPO_URL: https://github.com/LiBwrt-op/openwrt-6.x.git
+  REPO_BRANCH: main-nss  # 根据你的步骤5，分支似乎是 main-nss，如果克隆默认分支出错，请检查此处
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+    - name: Checkout context
+      uses: actions/checkout@v4
+
+    - name: Initialization Environment (Clean Disk)
+      env:
+        DEBIAN_FRONTEND: noninteractive
+      run: |
+        # 移除无用软件以释放磁盘空间 (确保满足25GB要求)
+        docker rmi `docker images -q`
+        sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
+        sudo -E apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox google-chrome-stable microsoft-edge-stable dotnet* powershell openjdk* mysql* php*
+        sudo -E apt-get update
+        
+        # 安装编译依赖 (根据你提供的信息)
+        sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
+        bzip2 ccache cmake cpio curl device-tree-compiler fastjar flex gawk gettext gcc-multilib g++-multilib \
+        git gperf haveged help2man intltool libc6-dev-i386 libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev \
+        libmpc-dev libmpfr-dev libncurses5-dev libncursesw5-dev libreadline-dev libfuse-dev libssl-dev libtool lrzsz \
+        genisoimage msmtp nano ninja-build p7zip p7zip-full patch pkgconf python3 python3-pip libpython3-dev qemu-utils \
+        rsync scons squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim wget xmlto xxd zlib1g-dev
+        
+        sudo -E apt-get -y autoremove --purge
+        sudo -E apt-get clean
+        
+        # 设置时区
+        sudo timedatectl set-timezone "$TZ"
+        echo "Disk space after cleanup:"
+        df -h
+
+    - name: Clone Source Code
+      run: |
+        # 对应步骤3: 克隆源码
+        # 注意：这里根据步骤5的信息推测分支可能为 main-nss，如果只是默认分支去掉 -b 参数即可
+        # git clone --depth 1 --single-branch $REPO_URL libwrt
+        git clone --depth 1 --single-branch -b $REPO_BRANCH $REPO_URL libwrt
+        echo "FILE_PATH=$PWD/libwrt" >> $GITHUB_ENV
+
+    - name: Update & Install Feeds
+      working-directory: ${{ env.FILE_PATH }}
+      run: |
+        # 对应步骤3: 更新 feeds
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Load Configuration
+      working-directory: ${{ env.FILE_PATH }}
+      run: |
+        # 处理配置文件
+        # 如果你的仓库根目录下有 .config 文件，则使用它
+        if [ -e $GITHUB_WORKSPACE/.config ]; then
+          echo "Found custom .config, using it..."
+          cp $GITHUB_WORKSPACE/.config ./.config
+        else
+          echo "No .config found, using default configuration (make defconfig)..."
+          make defconfig
+        fi
+
+    - name: Download Libraries
+      working-directory: ${{ env.FILE_PATH }}
+      run: |
+        # 对应步骤4: 下载依赖库
+        make download -j8
+        # 检查下载完整性 (find dl -size -1024c -exec ls -l {} \;)
+
+    - name: Compile Firmware
+      id: compile
+      working-directory: ${{ env.FILE_PATH }}
+      run: |
+        # 对应步骤4: 开始编译
+        echo "Starting build..."
+        # 尝试多线程编译，如果失败则回退到单线程显示错误日志
+        make -j$(nproc) || make -j1 V=s
+        echo "::set-output name=status::success"
+
+    - name: Organize Files
+      id: organize
+      if: steps.compile.outputs.status == 'success' && !cancelled()
+      run: |
+        # 整理输出文件
+        cd ${{ env.FILE_PATH }}/bin/targets/*/*
+        rm -rf packages
+        echo "FIRMWARE=$PWD" >> $GITHUB_ENV
+        echo "::set-output name=status::success"
+
+    - name: Upload Firmware Directory
+      uses: actions/upload-artifact@v4
+      if: steps.organize.outputs.status == 'success' && !cancelled()
+      with:
+        name: OpenWrt_firmware
+        path: ${{ env.FIRMWARE }}
