@@ -29,11 +29,6 @@ jobs:
       env:
         DEBIAN_FRONTEND: noninteractive
       run: |
-        # 移除无用软件以释放磁盘空间 (确保满足25GB要求)
-        docker rmi `docker images -q`
-        sudo rm -rf /usr/share/dotnet /etc/mysql /etc/php /usr/local/lib/android
-        sudo -E apt-get -y purge azure-cli ghc* zulu* hhvm llvm* firefox google-chrome-stable microsoft-edge-stable dotnet* powershell openjdk* mysql* php* || true
-        sudo -E apt-get update
         
         # 安装编译依赖 (根据你提供的信息)
         sudo -E apt-get -y install ack antlr3 asciidoc autoconf automake autopoint binutils bison build-essential \
