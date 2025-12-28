@@ -17,12 +17,13 @@ jobs:
   build:
     runs-on: ubuntu-22.04
 
+
     steps:
-    - name: Checkout context
-      uses: actions/checkout@v4
-  
     - name: Free disk space
       uses: sbwml/actions@free-disk
+      
+    - name: Checkout context
+      uses: actions/checkout@v4
 
     - name: Initialization Environment (Clean Disk)
       env:
