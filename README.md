@@ -1,0 +1,1 @@
+[![Build LiBwrt OpenWrt](https://github.com/EmptyGhost/LibWrt-JDC-RE-SS-01-CI/actions/workflows/build-openwrt.yml/badge.svg?event=release)](https://github.com/EmptyGhost/LibWrt-JDC-RE-SS-01-CI/actions/workflows/build-openwrt.yml)
